@@ -168,18 +168,18 @@ struct Args {
     #[arg(long)]
     verbose_prompt: bool,
 
-    #[arg(long)]
-    prompt: Option<String>,
+    //#[arg(long)]
+    //prompt: Option<String>,
 
     #[arg(long)]
     mmlu_dir: Option<String>,
 
     /// The temperature used to generate samples.
-    #[arg(long, default_value_t = 0.7)]
+    #[arg(long, default_value_t = 0.65)]
     temperature: f64,
 
     /// Nucleus sampling probability cutoff.
-    #[arg(long, default_value_t = 0.8)]
+    #[arg(long, default_value_t = 0.7)]
     top_p: f64,
 
     /// The seed to use when generating random samples.
@@ -412,6 +412,8 @@ fn load_model(api_repo: &ApiRepo, filenames: &Vec<PathBuf>, args: &Args) -> Resu
 
 
 fn main() -> Result<()> {
+    const POST_PROMPT : &str = "Answer the question only. Do not discuss other irrelevant stuff.";
+
     let args = parse_args();
 
     let api_repo = initialize_api_repo(&args)?;
@@ -423,22 +425,23 @@ fn main() -> Result<()> {
     loop {
         print!("> ");
         io::stdout().flush().unwrap();
-        let mut input = String::new();
+        let mut prompt = String::new();
 
         // Read the input from stdin
-        match io::stdin().read_line(&mut input) {
+        match io::stdin().read_line(&mut prompt) {
             Ok(0) => {
                 // Control-D is pressed, as no bytes were read
                 println!("exiting...");
                 break;
             }
             Ok(_) => {
-                if input == "\n" {
+                // Remove the newline character from the end of the input
+                prompt = prompt.trim_end().to_string();
+                if prompt.len() == 0 {
                     continue;
                 }
+                prompt = format!("{} {}", prompt, POST_PROMPT);
 
-                // Remove the newline character from the end of the input
-                input = input.trim_end().to_string();
                 // Print the input to verify it was read correctly
                 let mut pipeline = TextGeneration::new(
                     model.clone(),
@@ -452,7 +455,7 @@ fn main() -> Result<()> {
                     &device,
                 );
 
-                pipeline.run(&input, args.sample_len)?;
+                pipeline.run(&prompt, args.sample_len)?;
             }
             Err(error) => {
                 // Handle any errors that occur during reading
