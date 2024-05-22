@@ -1,0 +1,48 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug example 'quantized'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--features=cuda",
+                    "--example=quantized",
+                    "--package=candle-examples"
+                ],
+                "filter": {
+                    "name": "quantized",
+                    "kind": "example"
+                }
+            },
+            "args": [
+                "--which=phi3",
+                "--prompt=chat"
+            ],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug phi3",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--features=cuda",
+                    "--example=phi",
+                    "--package=candle-examples"
+                ],
+                "filter": {
+                    "name": "phi",
+                    "kind": "example"
+                }
+            },
+            "args": [
+                "--prompt='what is 2+3?'"
+            ],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

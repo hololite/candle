@@ -10,6 +10,7 @@ use hf_hub::api::sync::ApiError;
 use tracing_chrome::ChromeLayerBuilder;
 use tracing_subscriber::prelude::*;
 use std::path::PathBuf;
+use std::io::{self, Write};
 
 use candle_examples::token_output_stream::TokenOutputStream;
 use candle_transformers::models::mixformer::{Config, MixFormerSequentialForCausalLM as MixFormer};
@@ -23,6 +24,7 @@ use candle_transformers::generation::LogitsProcessor;
 use hf_hub::{api::sync::{Api, ApiRepo}, Repo, RepoType};
 use tokenizers::Tokenizer;
 
+#[derive(Clone)]
 enum Model {
     MixFormer(MixFormer),
     Phi(Phi),
@@ -155,7 +157,7 @@ enum WhichModel {
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Run on CPU rather than on GPU.
-    #[arg(long)]
+    #[arg(long, default_value_t = false)]
     cpu: bool,
 
     /// Enable tracing (generates a trace-timestamp.json file).
@@ -173,25 +175,25 @@ struct Args {
     mmlu_dir: Option<String>,
 
     /// The temperature used to generate samples.
-    #[arg(long)]
-    temperature: Option<f64>,
+    #[arg(long, default_value_t = 0.7)]
+    temperature: f64,
 
     /// Nucleus sampling probability cutoff.
-    #[arg(long)]
-    top_p: Option<f64>,
+    #[arg(long, default_value_t = 0.8)]
+    top_p: f64,
 
     /// The seed to use when generating random samples.
     #[arg(long, default_value_t = 299792458)]
     seed: u64,
 
     /// The length of the sample to generate (in tokens).
-    #[arg(long, short = 'n', default_value_t = 5000)]
+    #[arg(long, short = 'n', default_value_t = 10000)]
     sample_len: usize,
 
     #[arg(long)]
     model_id: Option<String>,
 
-    #[arg(long, default_value = "2")]
+    #[arg(long, default_value = "3")]
     model: WhichModel,
 
     #[arg(long)]
@@ -203,7 +205,7 @@ struct Args {
     #[arg(long)]
     tokenizer: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, default_value_t = false)]
     quantized: bool,
 
     /// Penalty to be applied for repeating tokens, 1. means no penalty.
@@ -237,7 +239,7 @@ fn parse_args() -> Args {
     );
     println!(
         "temp: {:.2} repeat-penalty: {:.2} repeat-last-n: {}",
-        args.temperature.unwrap_or(0.),
+        args.temperature,
         args.repeat_penalty,
         args.repeat_last_n
     );
@@ -342,14 +344,7 @@ fn initialize_tokenizer(api_repo: &ApiRepo, args: &Args) -> Result<(Tokenizer, V
     Ok((tokenizer, filenames))
 }
 
-
-fn main() -> Result<()> {
-    let args = parse_args();
-
-    let api_repo = initialize_api_repo(&args)?;
-
-    let (tokenizer, filenames) = initialize_tokenizer(&api_repo, &args)?;
-
+fn load_model(api_repo: &ApiRepo, filenames: &Vec<PathBuf>, args: &Args) -> Result<(Model, Device), E> {
     let start = std::time::Instant::now();
     let config = || match args.model {
         WhichModel::V1 => Config::v1(),
@@ -374,7 +369,7 @@ fn main() -> Result<()> {
         };
         Model::Quantized(model)
     } else {
-        let dtype = match args.dtype {
+        let dtype = match &args.dtype {
             Some(dtype) => std::str::FromStr::from_str(&dtype)?,
             None => {
                 if args.model == WhichModel::V3 && device.is_cuda() {
@@ -412,29 +407,65 @@ fn main() -> Result<()> {
     };
     println!("loaded the model in {:?}", start.elapsed());
 
-    match (args.prompt, args.mmlu_dir) {
-        (None, None) | (Some(_), Some(_)) => {
-            anyhow::bail!("exactly one of --prompt and --mmlu-dir must be specified")
+    Ok((model, device))
+}
+
+
+fn main() -> Result<()> {
+    let args = parse_args();
+
+    let api_repo = initialize_api_repo(&args)?;
+
+    let (tokenizer, filenames) = initialize_tokenizer(&api_repo, &args)?;
+
+    let (model, device) = load_model(&api_repo, &filenames, &args)?;
+
+    loop {
+        print!("> ");
+        io::stdout().flush().unwrap();
+        let mut input = String::new();
+
+        // Read the input from stdin
+        match io::stdin().read_line(&mut input) {
+            Ok(0) => {
+                // Control-D is pressed, as no bytes were read
+                println!("exiting...");
+                break;
+            }
+            Ok(_) => {
+                if input == "\n" {
+                    continue;
+                }
+
+                // Remove the newline character from the end of the input
+                input = input.trim_end().to_string();
+                // Print the input to verify it was read correctly
+                let mut pipeline = TextGeneration::new(
+                    model.clone(),
+                    tokenizer.clone(),
+                    args.seed,
+                    Some(args.temperature),
+                    Some(args.top_p),
+                    args.repeat_penalty,
+                    args.repeat_last_n,
+                    args.verbose_prompt,
+                    &device,
+                );
+
+                pipeline.run(&input, args.sample_len)?;
+            }
+            Err(error) => {
+                // Handle any errors that occur during reading
+                eprintln!("Error reading input: {}", error);
+                break;
+            }
         }
-        (Some(prompt), None) => {
-            let mut pipeline = TextGeneration::new(
-                model,
-                tokenizer,
-                args.seed,
-                args.temperature,
-                args.top_p,
-                args.repeat_penalty,
-                args.repeat_last_n,
-                args.verbose_prompt,
-                &device,
-            );
-            pipeline.run(&prompt, args.sample_len)?;
-        }
-        (None, Some(mmlu_dir)) => mmlu(model, tokenizer, &device, mmlu_dir)?,
     }
+
     Ok(())
 }
 
+#[allow(dead_code)]
 fn mmlu<P: AsRef<std::path::Path>>(
     mut model: Model,
     tokenizer: Tokenizer,

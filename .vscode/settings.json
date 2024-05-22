@@ -7,5 +7,20 @@
         "candle-pyo3"
     ],
     "python.testing.unittestEnabled": false,
-    "python.testing.pytestEnabled": true
+    "python.testing.pytestEnabled": true,
+
+
+  "editor.fontFamily": "'Droid Sans Mono', 'monospace', monospace",
+  "editor.fontLigatures": false,
+  "editor.fontSize": 11,
+  "editor.insertSpaces": true,
+  "editor.tabSize": 4,
+  "window.zoomLevel": 2,
+  "terminal.integrated.fontSize": 10,
+  "debug.console.fontSize": 10,
+  "workbench.tree.indent": 16,
+  "rust-analyzer.showUnlinkedFileNotification": false,
+  "workbench.colorCustomizations": {
+    "editor.background": "#051d41"
+  }
 }
