@@ -5,6 +5,7 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::{Error as E, Result};
+//use candle_transformers::models::segment_anything::prompt_encoder;
 //use candle_transformers::models::whisper::model;
 use clap::{Parser, ValueEnum};
 use hf_hub::api::sync::ApiError;
@@ -220,14 +221,15 @@ struct Args {
     #[arg(long)]
     dtype: Option<String>,
 }
-struct ModelInfo {
+#[derive(Clone)]
+struct ModelParams {
     model_ver: ModelVer,
     quantized: bool,
     revision: Option<String>,
     tokenizer: Option<String>,
     weight_file: Option<String>
 }
-impl ModelInfo {
+impl ModelParams {
     fn new(model_ver: ModelVer, quantized: bool, revision: Option<String>, tokenizer: Option<String>, weight_file: Option<String>) -> Self {
         Self {
             model_ver,
@@ -266,15 +268,15 @@ fn parse_args() -> Args {
 }
 
 
-fn initialize_api_repo(model_info: &ModelInfo) -> Result<ApiRepo, ApiError> {
+fn initialize_api_repo(model_params: &ModelParams) -> Result<ApiRepo, ApiError> {
     println!("initializing api repo...");
 
     let api = Api::new()?;
     let model_id = 
-        if model_info.quantized {
+        if model_params.quantized {
             "lmz/candle-quantized-phi".to_string()
         } else {
-            match model_info.model_ver {
+            match model_params.model_ver {
                 ModelVer::V1 => "microsoft/phi-1".to_string(),
                 ModelVer::V1_5 => "microsoft/phi-1_5".to_string(),
                 ModelVer::V2 | ModelVer::V2Old => "microsoft/phi-2".to_string(),
@@ -285,13 +287,13 @@ fn initialize_api_repo(model_info: &ModelInfo) -> Result<ApiRepo, ApiError> {
             }
         };
 
-    let revision = match &model_info.revision {
+    let revision = match &model_params.revision {
         Some(rev) => rev.to_string(),
         None => {
-            if model_info.quantized {
+            if model_params.quantized {
                 "main".to_string()
             } else {
-                match model_info.model_ver {
+                match model_params.model_ver {
                     ModelVer::V1 => "refs/pr/8".to_string(),
                     ModelVer::V1_5 => "refs/pr/73".to_string(),
                     ModelVer::V2Old => "834565c23f9b28b96ccbeabe614dd906b6db551a".to_string(),
@@ -308,12 +310,17 @@ fn initialize_api_repo(model_info: &ModelInfo) -> Result<ApiRepo, ApiError> {
     Ok(repo)
 }
 
-fn initialize_tokenizer(api_repo: &ApiRepo, model_info: &ModelInfo) -> Result<(Tokenizer, Vec<PathBuf>), E> {
+struct TokenizerInfo {
+    tokenizer: Tokenizer,
+    filenames: Vec<PathBuf>,
+}
+
+fn initialize_tokenizer(api_repo: &ApiRepo, model_params: &ModelParams) -> Result<TokenizerInfo, E> {
     let start = std::time::Instant::now();
 
-    let tokenizer_filename = match &model_info.tokenizer {
+    let tokenizer_filename = match &model_params.tokenizer {
         Some(file) => std::path::PathBuf::from(file),
-        None => match model_info.model_ver {
+        None => match model_params.model_ver {
             ModelVer::V1
             | ModelVer::V1_5
             | ModelVer::V2
@@ -325,11 +332,11 @@ fn initialize_tokenizer(api_repo: &ApiRepo, model_info: &ModelInfo) -> Result<(T
         },
     };
 
-    let filenames = match &model_info.weight_file {
+    let filenames = match &model_params.weight_file {
         Some(weight_file) => vec![std::path::PathBuf::from(weight_file)],
         None => {
-            if model_info.quantized {
-                match model_info.model_ver {
+            if model_params.quantized {
+                match model_params.model_ver {
                     ModelVer::V1 => vec![api_repo.get("model-v1-q4k.gguf")?],
                     ModelVer::V1_5 => vec![api_repo.get("model-q4k.gguf")?],
                     ModelVer::V2 | ModelVer::V2Old => vec![api_repo.get("model-v2-q4k.gguf")?],
@@ -340,7 +347,7 @@ fn initialize_tokenizer(api_repo: &ApiRepo, model_info: &ModelInfo) -> Result<(T
                     ),
                 }
             } else {
-                match model_info.model_ver {
+                match model_params.model_ver {
                     ModelVer::V1 | ModelVer::V1_5 => vec![api_repo.get("model.safetensors")?],
                     ModelVer::V2 | ModelVer::V2Old | ModelVer::V3 => {
                         candle_examples::hub_load_safetensors(
@@ -357,18 +364,23 @@ fn initialize_tokenizer(api_repo: &ApiRepo, model_info: &ModelInfo) -> Result<(T
     println!("retrieved the files in {:?}", start.elapsed());
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
 
-    Ok((tokenizer, filenames))
+    Ok(TokenizerInfo{tokenizer, filenames})
+}
+
+struct ModelInfo {
+    model: Model,
+    device: Device,
 }
 
 fn load_model(
     api_repo:   &ApiRepo, 
-    model_info: &ModelInfo, 
+    model_params: &ModelParams, 
     filenames:  &Vec<PathBuf>, 
     cpu:        bool, 
-    dtype:      Option<String>) 
-    -> Result<(Model, Device), E> {
+    dtype:      &Option<String>) 
+    -> Result<ModelInfo, E> {
     let start = std::time::Instant::now();
-    let config = || match model_info.model_ver {
+    let config = || match model_params.model_ver {
         ModelVer::V1 => Config::v1(),
         ModelVer::V1_5 => Config::v1_5(),
         ModelVer::V2 | ModelVer::V2Old => Config::v2(),
@@ -379,13 +391,13 @@ fn load_model(
         }
     };
     let device = candle_examples::device(cpu)?;
-    let model = if model_info.quantized {
+    let model = if model_params.quantized {
         let config = config();
         let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf(
             &filenames[0],
             &device,
         )?;
-        let model = match model_info.model_ver {
+        let model = match model_params.model_ver {
             ModelVer::V2 | ModelVer::V2Old => QMixFormer::new_v2(&config, vb)?,
             _ => QMixFormer::new(&config, vb)?,
         };
@@ -394,7 +406,7 @@ fn load_model(
         let dtype = match &dtype {
             Some(dtype) => std::str::FromStr::from_str(&dtype)?,
             None => {
-                if model_info.model_ver == ModelVer::V3 && device.is_cuda() {
+                if model_params.model_ver == ModelVer::V3 && device.is_cuda() {
                     DType::BF16
                 } else {
                     DType::F32
@@ -402,7 +414,7 @@ fn load_model(
             }
         };
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
-        match model_info.model_ver {
+        match model_params.model_ver {
             ModelVer::V1 | ModelVer::V1_5 | ModelVer::V2 => {
                 let config_filename = api_repo.get("config.json")?;
                 let config = std::fs::read_to_string(config_filename)?;
@@ -429,25 +441,92 @@ fn load_model(
     };
     println!("loaded the model in {:?}", start.elapsed());
 
-    Ok((model, device))
+    Ok(ModelInfo{model, device})
+}
+
+struct PromptParams {
+    sample_len: usize,
+    seed: u64,
+    temperature: f64,
+    top_p: f64,
+    repeat_penalty: f32,
+    repeat_last_n: usize,
+    verbose_prompt: bool,
+}
+
+impl PromptParams {
+    fn new(
+        sample_len: usize,
+        seed: u64,
+        temperature: f64,
+        top_p: f64,
+        repeat_penalty: f32,
+        repeat_last_n: usize,
+        verbose_prompt: bool
+        ) -> Self {
+        Self {
+            sample_len: sample_len,
+            seed: seed,
+            temperature: temperature,
+            top_p: top_p,
+            repeat_penalty: repeat_penalty,
+            repeat_last_n: repeat_last_n,
+            verbose_prompt: verbose_prompt,
+        }
+    }
+}
+
+fn submit_prompt(
+    prompt:         &str, 
+    prompt_params:  &PromptParams,
+    model_info:     &ModelInfo,
+    tokenizer:      &Tokenizer)
+    -> Result<()> {
+    let mut pipeline = TextGeneration::new(
+        model_info.model.clone(),
+        tokenizer.clone(),
+        prompt_params.seed,
+        Some(prompt_params.temperature),
+        Some(prompt_params.top_p),
+        prompt_params.repeat_penalty,
+        prompt_params.repeat_last_n,
+        prompt_params.verbose_prompt,
+        &model_info.device,
+    );
+
+    pipeline.run(prompt, prompt_params.sample_len)?;
+
+    Ok(())
 }
 
 
 fn main() -> Result<()> {
     let args = parse_args();
 
-    let model_info = ModelInfo::new(args.model, args.quantized, args.revision.clone(), args.tokenizer.clone(), args.weight_file.clone());
-    let api_repo = initialize_api_repo(&model_info)?;
+    let model_params = ModelParams::new(args.model, args.quantized, args.revision.clone(), args.tokenizer.clone(), args.weight_file.clone());
+    let api_repo = initialize_api_repo(&model_params)?;
 
-    let (tokenizer, tokenizer_filenames) = initialize_tokenizer(&api_repo, &model_info)?;
+    let tokenizer_info = initialize_tokenizer(&api_repo, &model_params)?;
 
-    let (model, device) = load_model(
+    let model_info = load_model(
         &api_repo,
-        &model_info,
-        &tokenizer_filenames,
+        &model_params,
+        &tokenizer_info.filenames,
         args.cpu,
-        args.dtype)?;
+        &args.dtype)?;
 
+    //
+    // Prompt the model
+    //
+    let prompt_params = PromptParams::new(
+        args.sample_len,
+        args.seed,
+        args.temperature,
+        args.top_p,
+        args.repeat_penalty,
+        args.repeat_last_n,
+        args.verbose_prompt
+    );
     loop {
         print!("> ");
         io::stdout().flush().unwrap();
@@ -468,20 +547,7 @@ fn main() -> Result<()> {
                 }
                 prompt = format!("{} {}", prompt, POST_PROMPT);
 
-                // Print the input to verify it was read correctly
-                let mut pipeline = TextGeneration::new(
-                    model.clone(),
-                    tokenizer.clone(),
-                    args.seed,
-                    Some(args.temperature),
-                    Some(args.top_p),
-                    args.repeat_penalty,
-                    args.repeat_last_n,
-                    args.verbose_prompt,
-                    &device,
-                );
-
-                pipeline.run(&prompt, args.sample_len)?;
+                submit_prompt(&prompt, &prompt_params, &model_info, &tokenizer_info.tokenizer)?;
             }
             Err(error) => {
                 // Handle any errors that occur during reading
