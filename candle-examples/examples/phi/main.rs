@@ -5,6 +5,7 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::{Error as E, Result};
+//use candle_transformers::models::whisper::model;
 use clap::{Parser, ValueEnum};
 use hf_hub::api::sync::ApiError;
 use tracing_chrome::ChromeLayerBuilder;
@@ -23,6 +24,8 @@ use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use hf_hub::{api::sync::{Api, ApiRepo}, Repo, RepoType};
 use tokenizers::Tokenizer;
+
+const POST_PROMPT : &str = "Answer the question only. Do not discuss other irrelevant stuff.";
 
 #[derive(Clone)]
 enum Model {
@@ -138,7 +141,7 @@ impl TextGeneration {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
-enum WhichModel {
+enum ModelVer {
     #[value(name = "1")]
     V1,
     #[value(name = "1.5")]
@@ -190,11 +193,8 @@ struct Args {
     #[arg(long, short = 'n', default_value_t = 10000)]
     sample_len: usize,
 
-    #[arg(long)]
-    model_id: Option<String>,
-
     #[arg(long, default_value = "3")]
-    model: WhichModel,
+    model: ModelVer,
 
     #[arg(long)]
     revision: Option<String>,
@@ -219,6 +219,24 @@ struct Args {
     /// The dtype to be used for running the model, e.g. f32, bf16, or f16.
     #[arg(long)]
     dtype: Option<String>,
+}
+struct ModelInfo {
+    model_ver: ModelVer,
+    quantized: bool,
+    revision: Option<String>,
+    tokenizer: Option<String>,
+    weight_file: Option<String>
+}
+impl ModelInfo {
+    fn new(model_ver: ModelVer, quantized: bool, revision: Option<String>, tokenizer: Option<String>, weight_file: Option<String>) -> Self {
+        Self {
+            model_ver,
+            quantized,
+            revision,
+            tokenizer,
+            weight_file
+        }
+    }
 }
 
 fn parse_args() -> Args {
@@ -247,42 +265,40 @@ fn parse_args() -> Args {
     args
 }
 
-fn initialize_api_repo(args: &Args) -> Result<ApiRepo, ApiError> {
+
+fn initialize_api_repo(model_info: &ModelInfo) -> Result<ApiRepo, ApiError> {
     println!("initializing api repo...");
 
     let api = Api::new()?;
-    let model_id = match &args.model_id {
-        Some(model_id) => model_id.to_string(),
-        None => {
-            if args.quantized {
-                "lmz/candle-quantized-phi".to_string()
-            } else {
-                match args.model {
-                    WhichModel::V1 => "microsoft/phi-1".to_string(),
-                    WhichModel::V1_5 => "microsoft/phi-1_5".to_string(),
-                    WhichModel::V2 | WhichModel::V2Old => "microsoft/phi-2".to_string(),
-                    WhichModel::V3 => "microsoft/Phi-3-mini-4k-instruct".to_string(),
-                    WhichModel::PuffinPhiV2 | WhichModel::PhiHermes => {
-                        "lmz/candle-quantized-phi".to_string()
-                    }
+    let model_id = 
+        if model_info.quantized {
+            "lmz/candle-quantized-phi".to_string()
+        } else {
+            match model_info.model_ver {
+                ModelVer::V1 => "microsoft/phi-1".to_string(),
+                ModelVer::V1_5 => "microsoft/phi-1_5".to_string(),
+                ModelVer::V2 | ModelVer::V2Old => "microsoft/phi-2".to_string(),
+                ModelVer::V3 => "microsoft/Phi-3-mini-4k-instruct".to_string(),
+                ModelVer::PuffinPhiV2 | ModelVer::PhiHermes => {
+                    "lmz/candle-quantized-phi".to_string()
                 }
             }
-        }
-    };
-    let revision = match &args.revision {
+        };
+
+    let revision = match &model_info.revision {
         Some(rev) => rev.to_string(),
         None => {
-            if args.quantized {
+            if model_info.quantized {
                 "main".to_string()
             } else {
-                match args.model {
-                    WhichModel::V1 => "refs/pr/8".to_string(),
-                    WhichModel::V1_5 => "refs/pr/73".to_string(),
-                    WhichModel::V2Old => "834565c23f9b28b96ccbeabe614dd906b6db551a".to_string(),
-                    WhichModel::V2
-                    | WhichModel::V3
-                    | WhichModel::PuffinPhiV2
-                    | WhichModel::PhiHermes => "main".to_string(),
+                match model_info.model_ver {
+                    ModelVer::V1 => "refs/pr/8".to_string(),
+                    ModelVer::V1_5 => "refs/pr/73".to_string(),
+                    ModelVer::V2Old => "834565c23f9b28b96ccbeabe614dd906b6db551a".to_string(),
+                    ModelVer::V2
+                    | ModelVer::V3
+                    | ModelVer::PuffinPhiV2
+                    | ModelVer::PhiHermes => "main".to_string(),
                 }
             }
         }
@@ -292,48 +308,48 @@ fn initialize_api_repo(args: &Args) -> Result<ApiRepo, ApiError> {
     Ok(repo)
 }
 
-fn initialize_tokenizer(api_repo: &ApiRepo, args: &Args) -> Result<(Tokenizer, Vec<PathBuf>), E> {
+fn initialize_tokenizer(api_repo: &ApiRepo, model_info: &ModelInfo) -> Result<(Tokenizer, Vec<PathBuf>), E> {
     let start = std::time::Instant::now();
 
-    let tokenizer_filename = match &args.tokenizer {
+    let tokenizer_filename = match &model_info.tokenizer {
         Some(file) => std::path::PathBuf::from(file),
-        None => match args.model {
-            WhichModel::V1
-            | WhichModel::V1_5
-            | WhichModel::V2
-            | WhichModel::V2Old
-            | WhichModel::V3 => api_repo.get("tokenizer.json")?,
-            WhichModel::PuffinPhiV2 | WhichModel::PhiHermes => {
+        None => match model_info.model_ver {
+            ModelVer::V1
+            | ModelVer::V1_5
+            | ModelVer::V2
+            | ModelVer::V2Old
+            | ModelVer::V3 => api_repo.get("tokenizer.json")?,
+            ModelVer::PuffinPhiV2 | ModelVer::PhiHermes => {
                 api_repo.get("tokenizer-puffin-phi-v2.json")?
             }
         },
     };
 
-    let filenames = match &args.weight_file {
+    let filenames = match &model_info.weight_file {
         Some(weight_file) => vec![std::path::PathBuf::from(weight_file)],
         None => {
-            if args.quantized {
-                match args.model {
-                    WhichModel::V1 => vec![api_repo.get("model-v1-q4k.gguf")?],
-                    WhichModel::V1_5 => vec![api_repo.get("model-q4k.gguf")?],
-                    WhichModel::V2 | WhichModel::V2Old => vec![api_repo.get("model-v2-q4k.gguf")?],
-                    WhichModel::PuffinPhiV2 => vec![api_repo.get("model-puffin-phi-v2-q4k.gguf")?],
-                    WhichModel::PhiHermes => vec![api_repo.get("model-phi-hermes-1_3B-q4k.gguf")?],
-                    WhichModel::V3 => anyhow::bail!(
+            if model_info.quantized {
+                match model_info.model_ver {
+                    ModelVer::V1 => vec![api_repo.get("model-v1-q4k.gguf")?],
+                    ModelVer::V1_5 => vec![api_repo.get("model-q4k.gguf")?],
+                    ModelVer::V2 | ModelVer::V2Old => vec![api_repo.get("model-v2-q4k.gguf")?],
+                    ModelVer::PuffinPhiV2 => vec![api_repo.get("model-puffin-phi-v2-q4k.gguf")?],
+                    ModelVer::PhiHermes => vec![api_repo.get("model-phi-hermes-1_3B-q4k.gguf")?],
+                    ModelVer::V3 => anyhow::bail!(
                         "use the quantized or quantized-phi examples for quantized phi-v3"
                     ),
                 }
             } else {
-                match args.model {
-                    WhichModel::V1 | WhichModel::V1_5 => vec![api_repo.get("model.safetensors")?],
-                    WhichModel::V2 | WhichModel::V2Old | WhichModel::V3 => {
+                match model_info.model_ver {
+                    ModelVer::V1 | ModelVer::V1_5 => vec![api_repo.get("model.safetensors")?],
+                    ModelVer::V2 | ModelVer::V2Old | ModelVer::V3 => {
                         candle_examples::hub_load_safetensors(
                             &api_repo,
                             "model.safetensors.index.json",
                         )?
                     }
-                    WhichModel::PuffinPhiV2 => vec![api_repo.get("model-puffin-phi-v2.safetensors")?],
-                    WhichModel::PhiHermes => vec![api_repo.get("model-phi-hermes-1_3B.safetensors")?],
+                    ModelVer::PuffinPhiV2 => vec![api_repo.get("model-puffin-phi-v2.safetensors")?],
+                    ModelVer::PhiHermes => vec![api_repo.get("model-phi-hermes-1_3B.safetensors")?],
                 }
             }
         }
@@ -344,35 +360,41 @@ fn initialize_tokenizer(api_repo: &ApiRepo, args: &Args) -> Result<(Tokenizer, V
     Ok((tokenizer, filenames))
 }
 
-fn load_model(api_repo: &ApiRepo, filenames: &Vec<PathBuf>, args: &Args) -> Result<(Model, Device), E> {
+fn load_model(
+    api_repo:   &ApiRepo, 
+    model_info: &ModelInfo, 
+    filenames:  &Vec<PathBuf>, 
+    cpu:        bool, 
+    dtype:      Option<String>) 
+    -> Result<(Model, Device), E> {
     let start = std::time::Instant::now();
-    let config = || match args.model {
-        WhichModel::V1 => Config::v1(),
-        WhichModel::V1_5 => Config::v1_5(),
-        WhichModel::V2 | WhichModel::V2Old => Config::v2(),
-        WhichModel::PuffinPhiV2 => Config::puffin_phi_v2(),
-        WhichModel::PhiHermes => Config::phi_hermes_1_3b(),
-        WhichModel::V3 => {
+    let config = || match model_info.model_ver {
+        ModelVer::V1 => Config::v1(),
+        ModelVer::V1_5 => Config::v1_5(),
+        ModelVer::V2 | ModelVer::V2Old => Config::v2(),
+        ModelVer::PuffinPhiV2 => Config::puffin_phi_v2(),
+        ModelVer::PhiHermes => Config::phi_hermes_1_3b(),
+        ModelVer::V3 => {
             panic!("use the quantized or quantized-phi examples for quantized phi-v3")
         }
     };
-    let device = candle_examples::device(args.cpu)?;
-    let model = if args.quantized {
+    let device = candle_examples::device(cpu)?;
+    let model = if model_info.quantized {
         let config = config();
         let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf(
             &filenames[0],
             &device,
         )?;
-        let model = match args.model {
-            WhichModel::V2 | WhichModel::V2Old => QMixFormer::new_v2(&config, vb)?,
+        let model = match model_info.model_ver {
+            ModelVer::V2 | ModelVer::V2Old => QMixFormer::new_v2(&config, vb)?,
             _ => QMixFormer::new(&config, vb)?,
         };
         Model::Quantized(model)
     } else {
-        let dtype = match &args.dtype {
+        let dtype = match &dtype {
             Some(dtype) => std::str::FromStr::from_str(&dtype)?,
             None => {
-                if args.model == WhichModel::V3 && device.is_cuda() {
+                if model_info.model_ver == ModelVer::V3 && device.is_cuda() {
                     DType::BF16
                 } else {
                     DType::F32
@@ -380,26 +402,26 @@ fn load_model(api_repo: &ApiRepo, filenames: &Vec<PathBuf>, args: &Args) -> Resu
             }
         };
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
-        match args.model {
-            WhichModel::V1 | WhichModel::V1_5 | WhichModel::V2 => {
+        match model_info.model_ver {
+            ModelVer::V1 | ModelVer::V1_5 | ModelVer::V2 => {
                 let config_filename = api_repo.get("config.json")?;
                 let config = std::fs::read_to_string(config_filename)?;
                 let config: PhiConfig = serde_json::from_str(&config)?;
                 let phi = Phi::new(&config, vb)?;
                 Model::Phi(phi)
             }
-            WhichModel::V3 => {
+            ModelVer::V3 => {
                 let config_filename = api_repo.get("config.json")?;
                 let config = std::fs::read_to_string(config_filename)?;
                 let config: Phi3Config = serde_json::from_str(&config)?;
                 let phi3 = Phi3::new(&config, vb)?;
                 Model::Phi3(phi3)
             }
-            WhichModel::V2Old => {
+            ModelVer::V2Old => {
                 let config = config();
                 Model::MixFormer(MixFormer::new_v2(&config, vb)?)
             }
-            WhichModel::PhiHermes | WhichModel::PuffinPhiV2 => {
+            ModelVer::PhiHermes | ModelVer::PuffinPhiV2 => {
                 let config = config();
                 Model::MixFormer(MixFormer::new(&config, vb)?)
             }
@@ -412,15 +434,19 @@ fn load_model(api_repo: &ApiRepo, filenames: &Vec<PathBuf>, args: &Args) -> Resu
 
 
 fn main() -> Result<()> {
-    const POST_PROMPT : &str = "Answer the question only. Do not discuss other irrelevant stuff.";
-
     let args = parse_args();
 
-    let api_repo = initialize_api_repo(&args)?;
+    let model_info = ModelInfo::new(args.model, args.quantized, args.revision.clone(), args.tokenizer.clone(), args.weight_file.clone());
+    let api_repo = initialize_api_repo(&model_info)?;
 
-    let (tokenizer, filenames) = initialize_tokenizer(&api_repo, &args)?;
+    let (tokenizer, tokenizer_filenames) = initialize_tokenizer(&api_repo, &model_info)?;
 
-    let (model, device) = load_model(&api_repo, &filenames, &args)?;
+    let (model, device) = load_model(
+        &api_repo,
+        &model_info,
+        &tokenizer_filenames,
+        args.cpu,
+        args.dtype)?;
 
     loop {
         print!("> ");
