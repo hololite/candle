@@ -7,6 +7,8 @@ extern crate accelerate_src;
 use clap::{Parser, ValueEnum};
 use std::io::Write;
 use tokenizers::Tokenizer;
+use tracing_chrome::ChromeLayerBuilder;
+use tracing_subscriber::prelude::*;
 
 use candle::quantized::{ggml_file, gguf_file};
 use candle::Tensor;
@@ -26,7 +28,7 @@ enum Prompt {
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq, ValueEnum)]
-enum Which {
+enum ModelType {
     #[value(name = "7b")]
     L7b,
     #[value(name = "13b")]
@@ -73,7 +75,7 @@ enum Which {
     Phi3,
 }
 
-impl Which {
+impl ModelType {
     fn is_mistral(&self) -> bool {
         match self {
             Self::L7b
@@ -246,7 +248,7 @@ struct Args {
 
     /// The model size to use.
     #[arg(long, default_value = "7b")]
-    which: Which,
+    which: ModelType,
 
     /// Group-Query Attention, use 8 for the 70B version of LLaMAv2.
     #[arg(long)]
@@ -258,6 +260,44 @@ struct Args {
 }
 
 impl Args {
+    fn parse_args() -> Self {
+        let args = Args::parse();
+        let _guard = if args.tracing {
+            let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
+            tracing_subscriber::registry().with(chrome_layer).init();
+            Some(guard)
+        } else {
+            None
+        };
+
+        println!(
+            "avx={}, neon={}, simd128={}, f16c={}",
+            candle::utils::with_avx(),
+            candle::utils::with_neon(),
+            candle::utils::with_simd128(),
+            candle::utils::with_f16c()
+        );
+
+        println!(
+            "model={:?}, tokenizer={:?}",
+            args.model,
+            args.tokenizer
+        );
+
+        println!(
+            "temp={:.2}, top-p={:?}, top-k={:?}, repeat-penalty={:.2}, repeat-last-n={}, seed={}, sample-len={}\n",
+            args.temperature,
+            args.top_p,
+            args.top_k,
+            args.repeat_penalty,
+            args.repeat_last_n,
+            args.seed,
+            args.sample_len
+        );
+
+        args
+    }
+
     fn tokenizer(&self) -> anyhow::Result<Tokenizer> {
         let tokenizer_path = match &self.tokenizer {
             Some(config) => std::path::PathBuf::from(config),
@@ -276,75 +316,75 @@ impl Args {
             Some(config) => std::path::PathBuf::from(config),
             None => {
                 let (repo, filename) = match self.which {
-                    Which::L7b => ("TheBloke/Llama-2-7B-GGML", "llama-2-7b.ggmlv3.q4_0.bin"),
-                    Which::L13b => ("TheBloke/Llama-2-13B-GGML", "llama-2-13b.ggmlv3.q4_0.bin"),
-                    Which::L70b => ("TheBloke/Llama-2-70B-GGML", "llama-2-70b.ggmlv3.q4_0.bin"),
-                    Which::L7bChat => (
+                    ModelType::L7b => ("TheBloke/Llama-2-7B-GGML", "llama-2-7b.ggmlv3.q4_0.bin"),
+                    ModelType::L13b => ("TheBloke/Llama-2-13B-GGML", "llama-2-13b.ggmlv3.q4_0.bin"),
+                    ModelType::L70b => ("TheBloke/Llama-2-70B-GGML", "llama-2-70b.ggmlv3.q4_0.bin"),
+                    ModelType::L7bChat => (
                         "TheBloke/Llama-2-7B-Chat-GGML",
                         "llama-2-7b-chat.ggmlv3.q4_0.bin",
                     ),
-                    Which::L13bChat => (
+                    ModelType::L13bChat => (
                         "TheBloke/Llama-2-13B-Chat-GGML",
                         "llama-2-13b-chat.ggmlv3.q4_0.bin",
                     ),
-                    Which::L70bChat => (
+                    ModelType::L70bChat => (
                         "TheBloke/Llama-2-70B-Chat-GGML",
                         "llama-2-70b-chat.ggmlv3.q4_0.bin",
                     ),
-                    Which::L7bCode => ("TheBloke/CodeLlama-7B-GGUF", "codellama-7b.Q8_0.gguf"),
-                    Which::L13bCode => ("TheBloke/CodeLlama-13B-GGUF", "codellama-13b.Q8_0.gguf"),
-                    Which::L34bCode => ("TheBloke/CodeLlama-34B-GGUF", "codellama-34b.Q8_0.gguf"),
-                    Which::Leo7b => (
+                    ModelType::L7bCode => ("TheBloke/CodeLlama-7B-GGUF", "codellama-7b.Q8_0.gguf"),
+                    ModelType::L13bCode => ("TheBloke/CodeLlama-13B-GGUF", "codellama-13b.Q8_0.gguf"),
+                    ModelType::L34bCode => ("TheBloke/CodeLlama-34B-GGUF", "codellama-34b.Q8_0.gguf"),
+                    ModelType::Leo7b => (
                         "TheBloke/leo-hessianai-7B-GGUF",
                         "leo-hessianai-7b.Q4_K_M.gguf",
                     ),
-                    Which::Leo13b => (
+                    ModelType::Leo13b => (
                         "TheBloke/leo-hessianai-13B-GGUF",
                         "leo-hessianai-13b.Q4_K_M.gguf",
                     ),
-                    Which::Mixtral => (
+                    ModelType::Mixtral => (
                         "TheBloke/Mixtral-8x7B-v0.1-GGUF",
                         "mixtral-8x7b-v0.1.Q4_K_M.gguf",
                     ),
-                    Which::MixtralInstruct => (
+                    ModelType::MixtralInstruct => (
                         "TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF",
                         "mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf",
                     ),
-                    Which::Mistral7b => (
+                    ModelType::Mistral7b => (
                         "TheBloke/Mistral-7B-v0.1-GGUF",
                         "mistral-7b-v0.1.Q4_K_S.gguf",
                     ),
-                    Which::Mistral7bInstruct => (
+                    ModelType::Mistral7bInstruct => (
                         "TheBloke/Mistral-7B-Instruct-v0.1-GGUF",
                         "mistral-7b-instruct-v0.1.Q4_K_S.gguf",
                     ),
-                    Which::Mistral7bInstructV02 => (
+                    ModelType::Mistral7bInstructV02 => (
                         "TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
                         "mistral-7b-instruct-v0.2.Q4_K_S.gguf",
                     ),
-                    Which::Zephyr7bAlpha => (
+                    ModelType::Zephyr7bAlpha => (
                         "TheBloke/zephyr-7B-alpha-GGUF",
                         "zephyr-7b-alpha.Q4_K_M.gguf",
                     ),
-                    Which::Zephyr7bBeta => {
+                    ModelType::Zephyr7bBeta => {
                         ("TheBloke/zephyr-7B-beta-GGUF", "zephyr-7b-beta.Q4_K_M.gguf")
                     }
-                    Which::OpenChat35 => ("TheBloke/openchat_3.5-GGUF", "openchat_3.5.Q4_K_M.gguf"),
-                    Which::Starling7bAlpha => (
+                    ModelType::OpenChat35 => ("TheBloke/openchat_3.5-GGUF", "openchat_3.5.Q4_K_M.gguf"),
+                    ModelType::Starling7bAlpha => (
                         "TheBloke/Starling-LM-7B-alpha-GGUF",
                         "starling-lm-7b-alpha.Q4_K_M.gguf",
                     ),
                     // TODO: swap to TheBloke model when available
-                    Which::L8b => (
+                    ModelType::L8b => (
                         "QuantFactory/Meta-Llama-3-8B-GGUF",
                         "Meta-Llama-3-8B.Q4_K_S.gguf",
                     ),
-                    Which::Phi3 => (
+                    ModelType::Phi3 => (
                         "microsoft/Phi-3-mini-4k-instruct-gguf",
                         "Phi-3-mini-4k-instruct-q4.gguf",
                     ),
                 };
-                let revision = if self.which == Which::Phi3 {
+                let revision = if self.which == ModelType::Phi3 {
                     "5eef2ce24766d31909c0b269fe90c817a8f263fb"
                 } else {
                     "main"
@@ -375,10 +415,7 @@ fn format_size(size_in_bytes: usize) -> String {
 }
 
 fn main() -> anyhow::Result<()> {
-    use tracing_chrome::ChromeLayerBuilder;
-    use tracing_subscriber::prelude::*;
-
-    let args = Args::parse();
+    let args = Args::parse_args();
 
     #[cfg(feature = "cuda")]
     candle::quantized::cuda::set_force_dmmv(args.force_dmmv);
@@ -445,28 +482,28 @@ fn main() -> anyhow::Result<()> {
             );
             println!("params: {:?}", model.hparams);
             let default_gqa = match args.which {
-                Which::L7b
-                | Which::L13b
-                | Which::L7bChat
-                | Which::L13bChat
-                | Which::L7bCode
-                | Which::L13bCode
-                | Which::L34bCode
-                | Which::Leo7b
-                | Which::Leo13b
-                | Which::L8b
-                | Which::Phi3 => 1,
-                Which::Mixtral
-                | Which::MixtralInstruct
-                | Which::Mistral7b
-                | Which::Mistral7bInstruct
-                | Which::Mistral7bInstructV02
-                | Which::Zephyr7bAlpha
-                | Which::Zephyr7bBeta
-                | Which::L70b
-                | Which::L70bChat
-                | Which::OpenChat35
-                | Which::Starling7bAlpha => 8,
+                ModelType::L7b
+                | ModelType::L13b
+                | ModelType::L7bChat
+                | ModelType::L13bChat
+                | ModelType::L7bCode
+                | ModelType::L13bCode
+                | ModelType::L34bCode
+                | ModelType::Leo7b
+                | ModelType::Leo13b
+                | ModelType::L8b
+                | ModelType::Phi3 => 1,
+                ModelType::Mixtral
+                | ModelType::MixtralInstruct
+                | ModelType::Mistral7b
+                | ModelType::Mistral7bInstruct
+                | ModelType::Mistral7bInstructV02
+                | ModelType::Zephyr7bAlpha
+                | ModelType::Zephyr7bBeta
+                | ModelType::L70b
+                | ModelType::L70bChat
+                | ModelType::OpenChat35
+                | ModelType::Starling7bAlpha => 8,
             };
             ModelWeights::from_ggml(model, args.gqa.unwrap_or(default_gqa))?
         }
@@ -573,7 +610,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         let eos_token = match args.which {
-            Which::L8b => "<|end_of_text|>",
+            ModelType::L8b => "<|end_of_text|>",
             _ => match args.which.is_open_chat() {
                 true => "<|end_of_turn|>",
                 false => "</s>",

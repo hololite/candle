@@ -14,16 +14,15 @@ use tracing_subscriber::prelude::*;
 use std::path::PathBuf;
 use std::io::{self, Write};
 
-use candle_examples::token_output_stream::TokenOutputStream;
-use candle_transformers::models::mixformer::{Config, MixFormerSequentialForCausalLM as MixFormer};
-use candle_transformers::models::phi::{Config as PhiConfig, Model as Phi};
-use candle_transformers::models::phi3::{Config as Phi3Config, Model as Phi3};
-use candle_transformers::models::quantized_mixformer::MixFormerSequentialForCausalLM as QMixFormer;
-
+use hf_hub::{api::sync::{Api, ApiRepo}, Repo, RepoType};
 use candle::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
+use candle_examples::token_output_stream::TokenOutputStream;
 use candle_transformers::generation::LogitsProcessor;
-use hf_hub::{api::sync::{Api, ApiRepo}, Repo, RepoType};
+use candle_transformers::models::phi3::{Config as Phi3Config, Model as Phi3};
+use candle_transformers::models::mixformer::{Config, MixFormerSequentialForCausalLM as MixFormer};
+use candle_transformers::models::phi::{Config as PhiConfig, Model as Phi};
+use candle_transformers::models::quantized_mixformer::MixFormerSequentialForCausalLM as QMixFormer;
 use tokenizers::Tokenizer;
 
 const POST_PROMPT : &str = "Answer the question only. Do not discuss other irrelevant stuff.";
@@ -221,6 +220,51 @@ struct Args {
     #[arg(long)]
     dtype: Option<String>,
 }
+
+impl Args {
+    fn parse_args() -> Self {
+        let args = Args::parse();
+        let _guard = if args.tracing {
+            let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
+            tracing_subscriber::registry().with(chrome_layer).init();
+            Some(guard)
+        } else {
+            None
+        };
+
+        println!(
+            "avx={}, neon={}, simd128={}, f16c={}",
+            candle::utils::with_avx(),
+            candle::utils::with_neon(),
+            candle::utils::with_simd128(),
+            candle::utils::with_f16c()
+        );
+
+        println!(
+            "quantized={}, model={:?}, dtype={:?}, tokenizer={:?}, weight_file={:?}, cpu={}, tracing={}",
+            args.quantized,
+            args.model,
+            args.dtype,
+            args.tokenizer,
+            args.weight_file,
+            args.cpu,
+            args.tracing
+        );
+
+        println!(
+            "temp={:.2}, top-p={:.2}, repeat-penalty={:.2}, repeat-last-n={}, seed={}, sample-len={}\n",
+            args.temperature,
+            args.top_p,
+            args.repeat_penalty,
+            args.repeat_last_n,
+            args.seed,
+            args.sample_len
+        );
+
+        args
+    }
+}
+
 #[derive(Clone)]
 struct ModelParams {
     model_ver: ModelVer,
@@ -239,32 +283,6 @@ impl ModelParams {
             weight_file
         }
     }
-}
-
-fn parse_args() -> Args {
-    let args = Args::parse();
-    let _guard = if args.tracing {
-        let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
-        tracing_subscriber::registry().with(chrome_layer).init();
-        Some(guard)
-    } else {
-        None
-    };
-    println!(
-        "avx: {}, neon: {}, simd128: {}, f16c: {}",
-        candle::utils::with_avx(),
-        candle::utils::with_neon(),
-        candle::utils::with_simd128(),
-        candle::utils::with_f16c()
-    );
-    println!(
-        "temp: {:.2} repeat-penalty: {:.2} repeat-last-n: {}",
-        args.temperature,
-        args.repeat_penalty,
-        args.repeat_last_n
-    );
-
-    args
 }
 
 
@@ -499,67 +517,6 @@ fn submit_prompt(
     Ok(())
 }
 
-
-fn main() -> Result<()> {
-    let args = parse_args();
-
-    let model_params = ModelParams::new(args.model, args.quantized, args.revision.clone(), args.tokenizer.clone(), args.weight_file.clone());
-    let api_repo = initialize_api_repo(&model_params)?;
-
-    let tokenizer_info = initialize_tokenizer(&api_repo, &model_params)?;
-
-    let model_info = load_model(
-        &api_repo,
-        &model_params,
-        &tokenizer_info.filenames,
-        args.cpu,
-        &args.dtype)?;
-
-    //
-    // Prompt the model
-    //
-    let prompt_params = PromptParams::new(
-        args.sample_len,
-        args.seed,
-        args.temperature,
-        args.top_p,
-        args.repeat_penalty,
-        args.repeat_last_n,
-        args.verbose_prompt
-    );
-    loop {
-        print!("> ");
-        io::stdout().flush().unwrap();
-        let mut prompt = String::new();
-
-        // Read the input from stdin
-        match io::stdin().read_line(&mut prompt) {
-            Ok(0) => {
-                // Control-D is pressed, as no bytes were read
-                println!("exiting...");
-                break;
-            }
-            Ok(_) => {
-                // Remove the newline character from the end of the input
-                prompt = prompt.trim_end().to_string();
-                if prompt.len() == 0 {
-                    continue;
-                }
-                prompt = format!("{} {}", prompt, POST_PROMPT);
-
-                submit_prompt(&prompt, &prompt_params, &model_info, &tokenizer_info.tokenizer)?;
-            }
-            Err(error) => {
-                // Handle any errors that occur during reading
-                eprintln!("Error reading input: {}", error);
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-
 #[allow(dead_code)]
 fn mmlu<P: AsRef<std::path::Path>>(
     mut model: Model,
@@ -646,5 +603,71 @@ fn mmlu<P: AsRef<std::path::Path>>(
             println!("{prompt}\n -> {model_answer} vs {answer}");
         }
     }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse_args();
+
+    let model_params = ModelParams::new(
+        args.model,
+        args.quantized,
+        args.revision.clone(),
+        args.tokenizer.clone(), 
+        args.weight_file.clone()
+    );
+    let api_repo = initialize_api_repo(&model_params)?;
+
+    let tokenizer_info = initialize_tokenizer(&api_repo, &model_params)?;
+
+    let model_info = load_model(
+        &api_repo,
+        &model_params,
+        &tokenizer_info.filenames,
+        args.cpu,
+        &args.dtype)?;
+
+    //
+    // Prompt the model
+    //
+    let prompt_params = PromptParams::new(
+        args.sample_len,
+        args.seed,
+        args.temperature,
+        args.top_p,
+        args.repeat_penalty,
+        args.repeat_last_n,
+        args.verbose_prompt
+    );
+    loop {
+        print!("> ");
+        io::stdout().flush().unwrap();
+        let mut prompt = String::new();
+
+        // Read the input from stdin
+        match io::stdin().read_line(&mut prompt) {
+            Ok(0) => {
+                // Control-D is pressed, as no bytes were read
+                println!("exiting...");
+                break;
+            }
+            Ok(_) => {
+                // Remove the newline character from the end of the input
+                prompt = prompt.trim_end().to_string();
+                if prompt.len() == 0 {
+                    continue;
+                }
+                prompt = format!("{} {}", prompt, POST_PROMPT);
+
+                submit_prompt(&prompt, &prompt_params, &model_info, &tokenizer_info.tokenizer)?;
+            }
+            Err(error) => {
+                // Handle any errors that occur during reading
+                eprintln!("Error reading input: {}", error);
+                break;
+            }
+        }
+    }
+
     Ok(())
 }

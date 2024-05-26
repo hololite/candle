@@ -14,21 +14,24 @@ extern crate intel_mkl_src;
 
 use anyhow::{bail, Error as E, Result};
 use clap::{Parser, ValueEnum};
+use std::io::Write;
+use tracing_chrome::ChromeLayerBuilder;
+use tracing_subscriber::prelude::*;
+use std::path::PathBuf;
 
+use hf_hub::{api::sync::{Api, ApiRepo, ApiError}, Repo, RepoType};
+use tokenizers::Tokenizer;
 use candle::{DType, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use hf_hub::{api::sync::Api, Repo, RepoType};
-use std::io::Write;
-
 use candle_transformers::models::llama as model;
-use model::{Llama, LlamaConfig};
+use model::{Llama, Cache, LlamaConfig as Config};
 
 const EOS_TOKEN: &str = "</s>";
 const DEFAULT_PROMPT: &str = "My favorite theorem is ";
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq, ValueEnum)]
-enum Which {
+enum ModelVer {
     V1,
     V2,
     V3,
@@ -90,10 +93,13 @@ struct Args {
 
     /// The model size to use.
     #[arg(long, default_value = "v3")]
-    which: Which,
+    model_ver: ModelVer,
 
     #[arg(long)]
     use_flash_attn: bool,
+
+    #[arg(long, default_value_t = false)]
+    quantized: bool,
 
     /// Penalty to be applied for repeating tokens, 1. means no penalty.
     #[arg(long, default_value_t = 1.1)]
@@ -104,19 +110,142 @@ struct Args {
     repeat_last_n: usize,
 }
 
-fn main() -> Result<()> {
-    use tokenizers::Tokenizer;
-    use tracing_chrome::ChromeLayerBuilder;
-    use tracing_subscriber::prelude::*;
+impl Args {
+    fn parse_args() -> Self {
+        let args = Args::parse();
+        let _guard = if args.tracing {
+            let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
+            tracing_subscriber::registry().with(chrome_layer).init();
+            Some(guard)
+        } else {
+            None
+        };
 
-    let args = Args::parse();
-    let _guard = if args.tracing {
-        let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
-        tracing_subscriber::registry().with(chrome_layer).init();
-        Some(guard)
-    } else {
-        None
+        println!(
+            "avx={}, neon={}, simd128={}, f16c={}",
+            candle::utils::with_avx(),
+            candle::utils::with_neon(),
+            candle::utils::with_simd128(),
+            candle::utils::with_f16c()
+        );
+
+        println!(
+            "dtype={:?}, cpu={}, tracing={}",
+            args.dtype,
+            args.cpu,
+            args.tracing
+        );
+
+        println!(
+            "temp={:.2}, top-p={:?}, top-k={:?}, repeat-penalty={:.2}, repeat-last-n={}, seed={}, sample-len={}\n",
+            args.temperature,
+            args.top_p,
+            args.top_k,
+            args.repeat_penalty,
+            args.repeat_last_n,
+            args.seed,
+            args.sample_len
+        );
+
+        args
+    }
+}
+
+#[derive(Clone)]
+struct ModelParams {
+    quantized: bool,
+    use_flash_attn: bool,
+    dtype: Option<String>,
+    model_ver: ModelVer,
+    revision: Option<String>
+}
+impl ModelParams {
+    fn new(quantized: bool, use_flash_attn: bool, dtype: Option<String>, model_ver: ModelVer, revision: Option<String>) -> Self {
+        Self {
+            quantized,
+            use_flash_attn,
+            dtype,
+            model_ver,
+            revision
+        }
+    }
+}
+
+fn initialize_api_repo(model_params: &ModelParams) -> Result<ApiRepo, ApiError> {
+    println!("initializing api repo...");
+
+    let api = Api::new()?;
+    let model_id =
+        if model_params.quantized {
+            "lmz/candle-quantized-phi".to_string()
+        } else {
+            match model_params.model_ver {
+                ModelVer::V1 => "Narsil/amall-7b".to_string(),
+                ModelVer::V2 => "meta-llama/Llama-2-7b-hf".to_string(),
+                ModelVer::V3 => "meta-llama/Meta-Llama-3-8B".to_string(),
+                ModelVer::V3Instruct => "meta-llama/Meta-Llama-3-8B-Instruct".to_string(),
+                ModelVer::Solar10_7B => "upstage/SOLAR-10.7B-v1.0".to_string(),
+                ModelVer::TinyLlama1_1BChat => "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string(),
+            }
+        };
+
+    //let revision = match &model_params.revision {
+    let revision = &model_params.revision.clone().unwrap_or("main".to_string());
+
+    let repo = api.repo(Repo::with_revision(model_id, RepoType::Model, revision.to_string()));
+
+    Ok(repo)
+}
+
+struct TokenizerInfo {
+    tokenizer: Tokenizer,
+    filename: PathBuf,
+    cache: Cache,
+    config: Config
+}
+
+fn initialize_tokenizer(api_repo: &ApiRepo, model_params: &ModelParams) -> Result<(TokenizerInfo, Llama), E> {
+    let tokenizer_filename = api_repo.get("tokenizer.json")?;
+    let config_filename = api_repo.get("config.json")?;
+    let lconfig: Config = serde_json::from_slice(&std::fs::read(config_filename)?)?;
+    let config = lconfig.clone().into_config(model_params.use_flash_attn);
+
+    let filenames = match model_params.model_ver {
+        ModelVer::V1 | ModelVer::V2 | ModelVer::V3 | ModelVer::V3Instruct | ModelVer::Solar10_7B => {
+            candle_examples::hub_load_safetensors(&api_repo, "model.safetensors.index.json")?
+        }
+        ModelVer::TinyLlama1_1BChat => vec![api_repo.get("model.safetensors")?],
     };
+
+    let cpu = false;
+    let no_kv_cache = false;
+    let device = candle_examples::device(cpu)?;
+    let dtype = match model_params.dtype.as_deref() {
+        Some("f16") => DType::F16,
+        Some("bf16") => DType::BF16,
+        Some("f32") => DType::F32,
+        Some(dtype) => bail!("Unsupported dtype {dtype}"),
+        None => DType::F16,
+    };
+    let cache = model::Cache::new(!no_kv_cache, dtype, &config, &device)?;
+
+    let vb = unsafe { 
+        VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? 
+    };
+    let llama = Llama::load(vb, &config)?;
+
+    let tokenizer = Tokenizer::from_file(tokenizer_filename.clone()).map_err(E::msg)?;
+
+    Ok((TokenizerInfo {
+        tokenizer,
+        filename: tokenizer_filename,
+        cache,
+        config: lconfig
+    }, llama))
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse_args();
 
     let device = candle_examples::device(args.cpu)?;
     let dtype = match args.dtype.as_deref() {
@@ -126,40 +255,42 @@ fn main() -> Result<()> {
         Some(dtype) => bail!("Unsupported dtype {dtype}"),
         None => DType::F16,
     };
-    let (llama, tokenizer_filename, mut cache, config) = {
-        let api = Api::new()?;
-        let model_id = args.model_id.unwrap_or_else(|| match args.which {
-            Which::V1 => "Narsil/amall-7b".to_string(),
-            Which::V2 => "meta-llama/Llama-2-7b-hf".to_string(),
-            Which::V3 => "meta-llama/Meta-Llama-3-8B".to_string(),
-            Which::V3Instruct => "meta-llama/Meta-Llama-3-8B-Instruct".to_string(),
-            Which::Solar10_7B => "upstage/SOLAR-10.7B-v1.0".to_string(),
-            Which::TinyLlama1_1BChat => "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string(),
-        });
-        println!("loading the model weights from {model_id}");
-        let revision = args.revision.unwrap_or("main".to_string());
-        let api = api.repo(Repo::with_revision(model_id, RepoType::Model, revision));
 
-        let tokenizer_filename = api.get("tokenizer.json")?;
-        let config_filename = api.get("config.json")?;
-        let config: LlamaConfig = serde_json::from_slice(&std::fs::read(config_filename)?)?;
-        let config = config.into_config(args.use_flash_attn);
+    let model_params = ModelParams::new(
+        false,
+        args.use_flash_attn,
+        args.dtype,
+        args.model_ver,
+        args.revision.clone()
+    );
+    let api_repo = initialize_api_repo(&model_params)?;
 
-        let filenames = match args.which {
-            Which::V1 | Which::V2 | Which::V3 | Which::V3Instruct | Which::Solar10_7B => {
-                candle_examples::hub_load_safetensors(&api, "model.safetensors.index.json")?
-            }
-            Which::TinyLlama1_1BChat => vec![api.get("model.safetensors")?],
-        };
-        let cache = model::Cache::new(!args.no_kv_cache, dtype, &config, &device)?;
+    let (tokenizer_info, llama) = initialize_tokenizer(&api_repo, &model_params)?;
+    /* 
 
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
-        (Llama::load(vb, &config)?, tokenizer_filename, cache, config)
+    let tokenizer_filename = api_repo.get("tokenizer.json")?;
+    let config_filename = api_repo.get("config.json")?;
+    let config: Config = serde_json::from_slice(&std::fs::read(config_filename)?)?;
+    let config = config.into_config(args.use_flash_attn);
+
+    let filenames = match args.model_ver {
+        ModelVer::V1 | ModelVer::V2 | ModelVer::V3 | ModelVer::V3Instruct | ModelVer::Solar10_7B => {
+            candle_examples::hub_load_safetensors(&api_repo, "model.safetensors.index.json")?
+        }
+        ModelVer::TinyLlama1_1BChat => vec![api_repo.get("model.safetensors")?],
     };
-    let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
-    let eos_token_id = config
+    let cache = model::Cache::new(!args.no_kv_cache, dtype, &config, &device)?;
+
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
+    (Llama::load(vb, &config)?, tokenizer_filename, cache, config)
+    */
+
+    let tokenizer = Tokenizer::from_file(tokenizer_info.filename).map_err(E::msg)?;
+    let eos_token_id = tokenizer_info.config
         .eos_token_id
         .or_else(|| tokenizer.token_to_id(EOS_TOKEN));
+
+
     let prompt = args.prompt.as_ref().map_or(DEFAULT_PROMPT, |p| p.as_str());
     let mut tokens = tokenizer
         .encode(prompt, true)
@@ -189,7 +320,7 @@ fn main() -> Result<()> {
     let mut index_pos = 0;
     let mut token_generated = 0;
     for index in 0..args.sample_len {
-        let (context_size, context_index) = if cache.use_kv_cache && index > 0 {
+        let (context_size, context_index) = if tokenizer_info.cache.use_kv_cache && index > 0 {
             (1, index_pos)
         } else {
             (tokens.len(), 0)
@@ -199,7 +330,7 @@ fn main() -> Result<()> {
         }
         let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
         let input = Tensor::new(ctxt, &device)?.unsqueeze(0)?;
-        let logits = llama.forward(&input, context_index, &mut cache)?;
+        let logits = llama.forward(&input, context_index, &mut tokenizer_info.cache.clone())?;
         let logits = logits.squeeze(0)?;
         let logits = if args.repeat_penalty == 1. {
             logits
