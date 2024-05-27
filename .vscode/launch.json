@@ -66,6 +66,27 @@
             "args": [
             ],
             "cwd": "${workspaceFolder}"
+        },
+
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug llama3",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--features=cuda",
+                    "--example=llama",
+                    "--package=candle-examples"
+                ],
+                "filter": {
+                    "name": "llama",
+                    "kind": "example"
+                }
+            },
+            "args": [
+            ],
+            "cwd": "${workspaceFolder}"
         }
     ]
 }

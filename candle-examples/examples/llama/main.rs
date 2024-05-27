@@ -17,9 +17,9 @@ use clap::{Parser, ValueEnum};
 use std::io::Write;
 use tracing_chrome::ChromeLayerBuilder;
 use tracing_subscriber::prelude::*;
-use std::path::PathBuf;
+//use std::path::PathBuf;
 
-use hf_hub::{api::sync::{Api, ApiRepo, ApiError}, Repo, RepoType};
+use hf_hub::{api::sync::{ApiBuilder, ApiRepo, ApiError}, Repo, RepoType};
 use tokenizers::Tokenizer;
 use candle::{DType, Tensor};
 use candle_nn::VarBuilder;
@@ -92,7 +92,7 @@ struct Args {
     revision: Option<String>,
 
     /// The model size to use.
-    #[arg(long, default_value = "v3")]
+    #[arg(long, default_value = "v3-instruct")]
     model_ver: ModelVer,
 
     #[arg(long)]
@@ -130,14 +130,16 @@ impl Args {
         );
 
         println!(
-            "dtype={:?}, cpu={}, tracing={}",
+            "model-id={:?}, model-ver={:?}, dtype={:?}, cpu={}, tracing={}",
+            args.model_id,
+            args.model_ver,
             args.dtype,
             args.cpu,
             args.tracing
         );
 
         println!(
-            "temp={:.2}, top-p={:?}, top-k={:?}, repeat-penalty={:.2}, repeat-last-n={}, seed={}, sample-len={}\n",
+            "temp={:.2}, top-p={:?}, top-k={:?}, repeat-penalty={:.2}\nrepeat-last-n={}, seed={}, sample-len={}\n",
             args.temperature,
             args.top_p,
             args.top_k,
@@ -171,10 +173,13 @@ impl ModelParams {
     }
 }
 
-fn initialize_api_repo(model_params: &ModelParams) -> Result<ApiRepo, ApiError> {
+fn initialize_api_repo(access_token: &str, model_params: &ModelParams) -> Result<ApiRepo, ApiError> {
     println!("initializing api repo...");
 
-    let api = Api::new()?;
+    let api_builder = ApiBuilder::new();
+    let api_builder_token =  api_builder.with_token(Some(String::from(access_token)));
+    let api = api_builder_token.build()?;
+
     let model_id =
         if model_params.quantized {
             "lmz/candle-quantized-phi".to_string()
@@ -189,9 +194,7 @@ fn initialize_api_repo(model_params: &ModelParams) -> Result<ApiRepo, ApiError> 
             }
         };
 
-    //let revision = match &model_params.revision {
     let revision = &model_params.revision.clone().unwrap_or("main".to_string());
-
     let repo = api.repo(Repo::with_revision(model_id, RepoType::Model, revision.to_string()));
 
     Ok(repo)
@@ -199,12 +202,13 @@ fn initialize_api_repo(model_params: &ModelParams) -> Result<ApiRepo, ApiError> 
 
 struct TokenizerInfo {
     tokenizer: Tokenizer,
-    filename: PathBuf,
     cache: Cache,
     config: Config
 }
 
 fn initialize_tokenizer(api_repo: &ApiRepo, model_params: &ModelParams) -> Result<(TokenizerInfo, Llama), E> {
+    println!("initializing tokenizer...");
+
     let tokenizer_filename = api_repo.get("tokenizer.json")?;
     let config_filename = api_repo.get("config.json")?;
     let lconfig: Config = serde_json::from_slice(&std::fs::read(config_filename)?)?;
@@ -232,29 +236,48 @@ fn initialize_tokenizer(api_repo: &ApiRepo, model_params: &ModelParams) -> Resul
     let vb = unsafe { 
         VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? 
     };
-    let llama = Llama::load(vb, &config)?;
 
+    println!("loading llama model...");
+    let llama = Llama::load(vb, &config)?;
+    println!("loading tokenizer from {:?}...", tokenizer_filename.clone());
     let tokenizer = Tokenizer::from_file(tokenizer_filename.clone()).map_err(E::msg)?;
 
-    Ok((TokenizerInfo {
+    Ok((TokenizerInfo{
         tokenizer,
-        filename: tokenizer_filename,
         cache,
         config: lconfig
     }, llama))
 }
 
+use serde::Deserialize;
+use std::fs;
+
+#[derive(Deserialize)]
+struct AppConfig {
+    api_key: String,
+}
+
+fn read_config(file_path: &str) -> Result<AppConfig, Box<dyn std::error::Error>> {
+    // Read the file content
+    let config_content = fs::read_to_string(file_path)?;
+    // Parse the JSON content
+    let config: AppConfig = serde_json::from_str(&config_content)?;
+    Ok(config)
+}
+
+
+
 fn main() -> Result<()> {
+    let config_file_path = ".config";
+    let access_token: String;
+    match read_config(config_file_path) {
+        Ok(config) => access_token = config.api_key,
+        Err(e) => panic!("Error reading config file: {}", e),
+    }
+
     let args = Args::parse_args();
 
     let device = candle_examples::device(args.cpu)?;
-    let dtype = match args.dtype.as_deref() {
-        Some("f16") => DType::F16,
-        Some("bf16") => DType::BF16,
-        Some("f32") => DType::F32,
-        Some(dtype) => bail!("Unsupported dtype {dtype}"),
-        None => DType::F16,
-    };
 
     let model_params = ModelParams::new(
         false,
@@ -263,41 +286,22 @@ fn main() -> Result<()> {
         args.model_ver,
         args.revision.clone()
     );
-    let api_repo = initialize_api_repo(&model_params)?;
+
+    let api_repo = initialize_api_repo(&access_token, &model_params)?;
 
     let (tokenizer_info, llama) = initialize_tokenizer(&api_repo, &model_params)?;
-    /* 
 
-    let tokenizer_filename = api_repo.get("tokenizer.json")?;
-    let config_filename = api_repo.get("config.json")?;
-    let config: Config = serde_json::from_slice(&std::fs::read(config_filename)?)?;
-    let config = config.into_config(args.use_flash_attn);
-
-    let filenames = match args.model_ver {
-        ModelVer::V1 | ModelVer::V2 | ModelVer::V3 | ModelVer::V3Instruct | ModelVer::Solar10_7B => {
-            candle_examples::hub_load_safetensors(&api_repo, "model.safetensors.index.json")?
-        }
-        ModelVer::TinyLlama1_1BChat => vec![api_repo.get("model.safetensors")?],
-    };
-    let cache = model::Cache::new(!args.no_kv_cache, dtype, &config, &device)?;
-
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
-    (Llama::load(vb, &config)?, tokenizer_filename, cache, config)
-    */
-
-    let tokenizer = Tokenizer::from_file(tokenizer_info.filename).map_err(E::msg)?;
     let eos_token_id = tokenizer_info.config
         .eos_token_id
-        .or_else(|| tokenizer.token_to_id(EOS_TOKEN));
-
+        .or_else(|| tokenizer_info.tokenizer.token_to_id(EOS_TOKEN));
 
     let prompt = args.prompt.as_ref().map_or(DEFAULT_PROMPT, |p| p.as_str());
-    let mut tokens = tokenizer
+    let mut tokens = tokenizer_info.tokenizer
         .encode(prompt, true)
         .map_err(E::msg)?
         .get_ids()
         .to_vec();
-    let mut tokenizer = candle_examples::token_output_stream::TokenOutputStream::new(tokenizer);
+    let mut tos = candle_examples::token_output_stream::TokenOutputStream::new(tokenizer_info.tokenizer);
 
     println!("starting the inference loop");
     print!("{prompt}");
@@ -351,12 +355,12 @@ fn main() -> Result<()> {
         if Some(next_token) == eos_token_id {
             break;
         }
-        if let Some(t) = tokenizer.next_token(next_token)? {
+        if let Some(t) = tos.next_token(next_token)? {
             print!("{t}");
             std::io::stdout().flush()?;
         }
     }
-    if let Some(rest) = tokenizer.decode_rest().map_err(E::msg)? {
+    if let Some(rest) = tos.decode_rest().map_err(E::msg)? {
         print!("{rest}");
     }
     let dt = start_gen.elapsed();
