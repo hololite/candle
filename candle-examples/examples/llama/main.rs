@@ -19,7 +19,7 @@ use tokenizers::Tokenizer;
 use tracing_chrome::ChromeLayerBuilder;
 use tracing_subscriber::prelude::*;
 use serde::Deserialize;
-use std::io::Write;
+use std::io::{self, Write};
 
 use hf_hub::{api::sync::{ApiBuilder, ApiRepo, ApiError}, Repo, RepoType};
 use candle::{DType, Tensor, Device};
@@ -29,7 +29,7 @@ use candle_transformers::models::llama as model;
 use model::{Llama, Cache, LlamaConfig, Config};
 
 const EOS_TOKEN: &str = "</s>";
-const DEFAULT_PROMPT: &str = "My favorite theorem is ";
+const POST_PROMPT : &str = ". Answer the question concisely. Do not discuss other irrelevant stuff.";
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq, ValueEnum)]
 enum ModelVer {
@@ -43,7 +43,7 @@ enum ModelVer {
     TinyLlama1_1BChat,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Clone, Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Run on CPU rather than on GPU.
@@ -212,13 +212,15 @@ fn initialize_api_repo(access_token: &str, model_params: &ModelParams) -> Result
 
     Ok(repo)
 }
-struct TokenizerInfo {
+struct ModelInfo {
+    llama: Llama,
     tokenizer: Tokenizer,
     cache: Cache,
     config: Config
 }
 
-fn initialize_model_tokenizer(api_repo: &ApiRepo, device: &Device, model_params: &ModelParams) -> Result<(Llama, TokenizerInfo), E> {
+
+fn load_model(api_repo: &ApiRepo, device: &Device, model_params: &ModelParams) -> Result<ModelInfo, E> {
     let dtype = match model_params.dtype.as_deref() {
         Some("f16") => DType::F16,
         Some("bf16") => DType::BF16,
@@ -260,53 +262,41 @@ fn initialize_model_tokenizer(api_repo: &ApiRepo, device: &Device, model_params:
 
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
 
-    let tokenizer_info = TokenizerInfo {
+    let model_info = ModelInfo {
+        llama,
         tokenizer,
         cache,
         config
     };
 
-    Ok((llama, tokenizer_info))
+    Ok(model_info)
 }
 
-fn main() -> Result<()> {
-    let config_file_path = ".config";
-    let access_token: String;
-    match read_config(config_file_path) {
-        Ok(config) => access_token = config.api_key,
-        Err(e) => panic!("Error reading config file: {}", e),
-    }
+struct PromptParams {
+    temperature: f64,
+    top_k: Option<usize>,
+    top_p: Option<f64>,
+    seed: u64,
+    sample_len: usize,
+    repeat_penalty: f32,
+    repeat_last_n: usize
+}
 
-    let args = Args::parse_args();
-
-    let device = candle_examples::device(args.cpu)?;
-
-    let model_params = ModelParams::new(
-        false,
-        args.use_flash_attn,
-        args.dtype.clone(),
-        args.model_ver,
-        args.model_id,
-        args.revision.clone()
-    );
-
-    let api_repo = initialize_api_repo(&access_token, &model_params)?;
-
-    let (llama, tokenizer_info) = initialize_model_tokenizer(&api_repo, &device, &model_params)?;
-
-    let eos_token_id = tokenizer_info.config
+fn submit_prompt(model_info: &ModelInfo, device: &Device, prompt: &str, args: &PromptParams) -> Result<(), E> {
+    let eos_token_id = model_info.config
         .eos_token_id
-        .or_else(|| tokenizer_info.tokenizer.token_to_id(EOS_TOKEN));
-    let prompt = args.prompt.as_ref().map_or(DEFAULT_PROMPT, |p| p.as_str());
-    let mut tokens = tokenizer_info.tokenizer
+        .or_else(|| model_info.tokenizer.token_to_id(EOS_TOKEN));
+
+    //let prompt = args.prompt.as_ref().map_or(DEFAULT_PROMPT, |p| p.as_str());
+    let mut tokens = model_info.tokenizer
         .encode(prompt, true)
         .map_err(E::msg)?
         .get_ids()
         .to_vec();
-    let mut tos = candle_examples::token_output_stream::TokenOutputStream::new(tokenizer_info.tokenizer);
+    let mut tos = candle_examples::token_output_stream::TokenOutputStream::new(model_info.tokenizer.clone());
 
     println!("starting the inference loop");
-    print!("{prompt}");
+    println!("#### prompt=[{prompt}]\n");
     let mut logits_processor = {
         let temperature = args.temperature;
         let sampling = if temperature <= 0. {
@@ -326,7 +316,7 @@ fn main() -> Result<()> {
     let mut index_pos = 0;
     let mut token_generated = 0;
 
-    let mut cache = tokenizer_info.cache.clone();
+    let mut cache = model_info.cache.clone();
     for index in 0..args.sample_len {
         let (context_size, context_index) = if cache.use_kv_cache && index > 0 {
             (1, index_pos)
@@ -337,8 +327,8 @@ fn main() -> Result<()> {
             start_gen = std::time::Instant::now()
         }
         let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
-        let input = Tensor::new(ctxt, &device)?.unsqueeze(0)?;
-        let logits = llama.forward(&input, context_index, &mut cache)?;
+        let input = Tensor::new(ctxt, device)?.unsqueeze(0)?;
+        let logits = model_info.llama.forward(&input, context_index, &mut cache)?;
         let logits = logits.squeeze(0)?;
         let logits = if args.repeat_penalty == 1. {
             logits
@@ -373,5 +363,80 @@ fn main() -> Result<()> {
         token_generated,
         (token_generated - 1) as f64 / dt.as_secs_f64(),
     );
+
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let config_file_path = ".config";
+    let access_token: String;
+    match read_config(config_file_path) {
+        Ok(config) => access_token = config.api_key,
+        Err(e) => panic!("Error reading config file: {}", e),
+    }
+
+    let args = Args::parse_args();
+
+    let device = candle_examples::device(args.cpu)?;
+
+    let model_params = ModelParams::new(
+        false,
+        args.use_flash_attn,
+        args.dtype.clone(),
+        args.model_ver,
+        args.model_id.clone(),
+        args.revision.clone()
+    );
+
+    let api_repo = initialize_api_repo(&access_token, &model_params)?;
+
+    let model_info = load_model(&api_repo, &device, &model_params)?;
+
+    let prompt_params  = PromptParams {
+        temperature: args.temperature,
+        top_k: args.top_k,
+        top_p: args.top_p,
+        seed: args.seed,
+        sample_len: args.sample_len,
+        repeat_penalty: args.repeat_penalty,
+        repeat_last_n: args.repeat_last_n
+    };
+
+    if args.prompt.is_none() {
+        loop {
+            print!("> ");
+            io::stdout().flush().unwrap();
+            let mut prompt = String::new();
+
+            // Read the input from stdin
+            match io::stdin().read_line(&mut prompt) {
+                Ok(0) => {
+                    // Control-D is pressed, as no bytes were read
+                    println!("exiting...");
+                    break;
+                }
+                Ok(_) => {
+                    // Remove the newline character from the end of the input
+                    prompt = prompt.trim_end().to_string();
+                    if prompt.len() == 0 {
+                        continue;
+                    }
+                    prompt = format!("{} {}", prompt, POST_PROMPT);
+
+                    submit_prompt(&model_info, &device, &prompt, &prompt_params)?;
+                }
+                Err(error) => {
+                    // Handle any errors that occur during reading
+                    eprintln!("Error reading input: {}", error);
+                    break;
+                }
+            }
+        }
+    }
+    else {
+        let prompt = format!("{} {}", args.prompt.unwrap(), POST_PROMPT);
+        submit_prompt(&model_info, &device, &prompt, &prompt_params)?;
+    }
+
     Ok(())
 }
