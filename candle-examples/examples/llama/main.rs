@@ -12,20 +12,21 @@ extern crate accelerate_src;
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 
+use std::fs;
 use anyhow::{bail, Error as E, Result};
 use clap::{Parser, ValueEnum};
-use std::io::Write;
+use tokenizers::Tokenizer;
 use tracing_chrome::ChromeLayerBuilder;
 use tracing_subscriber::prelude::*;
-//use std::path::PathBuf;
+use serde::Deserialize;
+use std::io::Write;
 
 use hf_hub::{api::sync::{ApiBuilder, ApiRepo, ApiError}, Repo, RepoType};
-use tokenizers::Tokenizer;
-use candle::{DType, Tensor};
+use candle::{DType, Tensor, Device};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::llama as model;
-use model::{Llama, Cache, LlamaConfig as Config};
+use model::{Llama, Cache, LlamaConfig, Config};
 
 const EOS_TOKEN: &str = "</s>";
 const DEFAULT_PROMPT: &str = "My favorite theorem is ";
@@ -50,7 +51,7 @@ struct Args {
     cpu: bool,
 
     /// The temperature used to generate samples.
-    #[arg(long, default_value_t = 0.8)]
+    #[arg(long, default_value_t = 0.65)]
     temperature: f64,
 
     /// Nucleus sampling probability cutoff.
@@ -97,9 +98,6 @@ struct Args {
 
     #[arg(long)]
     use_flash_attn: bool,
-
-    #[arg(long, default_value_t = false)]
-    quantized: bool,
 
     /// Penalty to be applied for repeating tokens, 1. means no penalty.
     #[arg(long, default_value_t = 1.1)]
@@ -159,18 +157,33 @@ struct ModelParams {
     use_flash_attn: bool,
     dtype: Option<String>,
     model_ver: ModelVer,
+    model_id: Option<String>,
     revision: Option<String>
 }
 impl ModelParams {
-    fn new(quantized: bool, use_flash_attn: bool, dtype: Option<String>, model_ver: ModelVer, revision: Option<String>) -> Self {
+    fn new(quantized: bool, use_flash_attn: bool, dtype: Option<String>, model_ver: ModelVer, model_id: Option<String>, revision: Option<String>) -> Self {
         Self {
             quantized,
             use_flash_attn,
             dtype,
             model_ver,
+            model_id,
             revision
         }
     }
+}
+
+#[derive(Deserialize)]
+struct AppConfig {
+    api_key: String,
+}
+
+fn read_config(file_path: &str) -> Result<AppConfig, Box<dyn std::error::Error>> {
+    // Read the file content
+    let config_content = fs::read_to_string(file_path)?;
+    // Parse the JSON content
+    let config: AppConfig = serde_json::from_str(&config_content)?;
+    Ok(config)
 }
 
 fn initialize_api_repo(access_token: &str, model_params: &ModelParams) -> Result<ApiRepo, ApiError> {
@@ -199,31 +212,13 @@ fn initialize_api_repo(access_token: &str, model_params: &ModelParams) -> Result
 
     Ok(repo)
 }
-
 struct TokenizerInfo {
     tokenizer: Tokenizer,
     cache: Cache,
     config: Config
 }
 
-fn initialize_tokenizer(api_repo: &ApiRepo, model_params: &ModelParams) -> Result<(TokenizerInfo, Llama), E> {
-    println!("initializing tokenizer...");
-
-    let tokenizer_filename = api_repo.get("tokenizer.json")?;
-    let config_filename = api_repo.get("config.json")?;
-    let lconfig: Config = serde_json::from_slice(&std::fs::read(config_filename)?)?;
-    let config = lconfig.clone().into_config(model_params.use_flash_attn);
-
-    let filenames = match model_params.model_ver {
-        ModelVer::V1 | ModelVer::V2 | ModelVer::V3 | ModelVer::V3Instruct | ModelVer::Solar10_7B => {
-            candle_examples::hub_load_safetensors(&api_repo, "model.safetensors.index.json")?
-        }
-        ModelVer::TinyLlama1_1BChat => vec![api_repo.get("model.safetensors")?],
-    };
-
-    let cpu = false;
-    let no_kv_cache = false;
-    let device = candle_examples::device(cpu)?;
+fn initialize_model_tokenizer(api_repo: &ApiRepo, device: &Device, model_params: &ModelParams) -> Result<(Llama, TokenizerInfo), E> {
     let dtype = match model_params.dtype.as_deref() {
         Some("f16") => DType::F16,
         Some("bf16") => DType::BF16,
@@ -231,41 +226,48 @@ fn initialize_tokenizer(api_repo: &ApiRepo, model_params: &ModelParams) -> Resul
         Some(dtype) => bail!("Unsupported dtype {dtype}"),
         None => DType::F16,
     };
-    let cache = model::Cache::new(!no_kv_cache, dtype, &config, &device)?;
 
-    let vb = unsafe { 
-        VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? 
+    //let (llama, tokenizer_filename, mut cache, config) = {
+    let model_id = model_params.model_id.clone();
+    let model_id = model_id.unwrap_or_else(|| match model_params.model_ver {
+        ModelVer::V1 => "Narsil/amall-7b".to_string(),
+        ModelVer::V2 => "meta-llama/Llama-2-7b-hf".to_string(),
+        ModelVer::V3 => "meta-llama/Meta-Llama-3-8B".to_string(),
+        ModelVer::V3Instruct => "meta-llama/Meta-Llama-3-8B-Instruct".to_string(),
+        ModelVer::Solar10_7B => "upstage/SOLAR-10.7B-v1.0".to_string(),
+        ModelVer::TinyLlama1_1BChat => "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string(),
+    });
+    println!("loading the model weights from {model_id}");
+
+    let tokenizer_filename = api_repo.get("tokenizer.json")?;
+    let config_filename = api_repo.get("config.json")?;
+    let lconfig: LlamaConfig = serde_json::from_slice(&std::fs::read(config_filename)?)?;
+    let config = lconfig.into_config(model_params.use_flash_attn);
+
+    let filenames = match model_params.model_ver {
+        ModelVer::V1 | ModelVer::V2 | ModelVer::V3 | ModelVer::V3Instruct | ModelVer::Solar10_7B => {
+            candle_examples::hub_load_safetensors(&api_repo, "model.safetensors.index.json")?
+        }
+        ModelVer::TinyLlama1_1BChat => vec![api_repo.get("model.safetensors")?],
     };
+    let no_kv_cache = false;
+    let cache = model::Cache::new(!no_kv_cache, dtype, &config, device)?;
 
-    println!("loading llama model...");
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
+    //(Llama::load(vb, &config)?, tokenizer_filename, cache, config)
     let llama = Llama::load(vb, &config)?;
-    println!("loading tokenizer from {:?}...", tokenizer_filename.clone());
-    let tokenizer = Tokenizer::from_file(tokenizer_filename.clone()).map_err(E::msg)?;
+    //};
 
-    Ok((TokenizerInfo{
+    let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
+
+    let tokenizer_info = TokenizerInfo {
         tokenizer,
         cache,
-        config: lconfig
-    }, llama))
+        config
+    };
+
+    Ok((llama, tokenizer_info))
 }
-
-use serde::Deserialize;
-use std::fs;
-
-#[derive(Deserialize)]
-struct AppConfig {
-    api_key: String,
-}
-
-fn read_config(file_path: &str) -> Result<AppConfig, Box<dyn std::error::Error>> {
-    // Read the file content
-    let config_content = fs::read_to_string(file_path)?;
-    // Parse the JSON content
-    let config: AppConfig = serde_json::from_str(&config_content)?;
-    Ok(config)
-}
-
-
 
 fn main() -> Result<()> {
     let config_file_path = ".config";
@@ -282,19 +284,19 @@ fn main() -> Result<()> {
     let model_params = ModelParams::new(
         false,
         args.use_flash_attn,
-        args.dtype,
+        args.dtype.clone(),
         args.model_ver,
+        args.model_id,
         args.revision.clone()
     );
 
     let api_repo = initialize_api_repo(&access_token, &model_params)?;
 
-    let (tokenizer_info, llama) = initialize_tokenizer(&api_repo, &model_params)?;
+    let (llama, tokenizer_info) = initialize_model_tokenizer(&api_repo, &device, &model_params)?;
 
     let eos_token_id = tokenizer_info.config
         .eos_token_id
         .or_else(|| tokenizer_info.tokenizer.token_to_id(EOS_TOKEN));
-
     let prompt = args.prompt.as_ref().map_or(DEFAULT_PROMPT, |p| p.as_str());
     let mut tokens = tokenizer_info.tokenizer
         .encode(prompt, true)
@@ -323,8 +325,10 @@ fn main() -> Result<()> {
     let mut start_gen = std::time::Instant::now();
     let mut index_pos = 0;
     let mut token_generated = 0;
+
+    let mut cache = tokenizer_info.cache.clone();
     for index in 0..args.sample_len {
-        let (context_size, context_index) = if tokenizer_info.cache.use_kv_cache && index > 0 {
+        let (context_size, context_index) = if cache.use_kv_cache && index > 0 {
             (1, index_pos)
         } else {
             (tokens.len(), 0)
@@ -334,7 +338,7 @@ fn main() -> Result<()> {
         }
         let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
         let input = Tensor::new(ctxt, &device)?.unsqueeze(0)?;
-        let logits = llama.forward(&input, context_index, &mut tokenizer_info.cache.clone())?;
+        let logits = llama.forward(&input, context_index, &mut cache)?;
         let logits = logits.squeeze(0)?;
         let logits = if args.repeat_penalty == 1. {
             logits
